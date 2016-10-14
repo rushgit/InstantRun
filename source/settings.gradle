@@ -1,0 +1,5 @@
+include ':instant-run-annotations'
+include ':instant-run-common'
+include ':instant-run-server'
+include ':instant-run-client'
+include ':instant-run-runtime'
