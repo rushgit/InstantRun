@@ -43,7 +43,7 @@ App需要重启,但不需要重新安装。适用于代码结构和方法签名�
 ##Instant Run启动过程
 首先看app的入口BootstrapApplication,先看attachBaseContext()
 
-###attachBaseContext()
+###1.　attachBaseContext()
 ```java
     protected void attachBaseContext(Context context) {
             // As of Marshmallow, we use APK splits and don't need to rely on
@@ -75,6 +75,212 @@ App需要重启,但不需要重新安装。适用于代码结构和方法签名�
             }
     }
 ```
+
+依次看createResources　->　setupClassLoaders　->　createRealApplication　->　调用real　application的attachBaseContext方法
+
+####1.1　createResources()
+```java
+private void createResources(long apkModified) {
+        // Look for changes stashed in the inbox folder while the server was not running
+        FileManager.checkInbox();
+
+        File file = FileManager.getExternalResourceFile();
+        externalResourcePath = file != null ? file.getPath() : null;
+
+        if (Log.isLoggable(LOG_TAG, Log.VERBOSE)) {
+            Log.v(LOG_TAG, "Resource override is " + externalResourcePath);
+        }
+
+        if (file != null) {
+            try {
+                long resourceModified = file.lastModified();
+                if (Log.isLoggable(LOG_TAG, Log.VERBOSE)) {
+                    Log.v(LOG_TAG, "Resource patch last modified: " + resourceModified);
+                    Log.v(LOG_TAG, "APK last modified: " + apkModified + " " +
+                            (apkModified > resourceModified ? ">" : "<") + " resource patch");
+                }
+
+                if (apkModified == 0L || resourceModified <= apkModified) {
+                    if (Log.isLoggable(LOG_TAG, Log.VERBOSE)) {
+                        Log.v(LOG_TAG, "Ignoring resource file, older than APK");
+                    }
+                    externalResourcePath = null;
+                }
+            } catch (Throwable t) {
+                Log.e(LOG_TAG, "Failed to check patch timestamps", t);
+            }
+        }
+    }
+```
+该方法主要判断外部资源有没有更新,并把路径存储在externalResourcePath变量上。
+
+####1.2　setupClassLoaders()
+```java
+private static void setupClassLoaders(Context context, String codeCacheDir, long apkModified) {
+        List<String> dexList = FileManager.getDexList(context, apkModified);
+
+        // Make sure class loader finds these
+        @SuppressWarnings("unused") Class<Server> server = Server.class;
+        @SuppressWarnings("unused") Class<MonkeyPatcher> patcher = MonkeyPatcher.class;
+
+        if (!dexList.isEmpty()) {
+            if (Log.isLoggable(LOG_TAG, Log.VERBOSE)) {
+                Log.v(LOG_TAG, "Bootstrapping class loader with dex list " + join('\n', dexList));
+            }
+
+            ClassLoader classLoader = BootstrapApplication.class.getClassLoader();
+            String nativeLibraryPath;
+            try {
+                nativeLibraryPath = (String) classLoader.getClass().getMethod("getLdLibraryPath")
+                                .invoke(classLoader);
+                if (Log.isLoggable(LOG_TAG, Log.VERBOSE)) {
+                    Log.v(LOG_TAG, "Native library path: " + nativeLibraryPath);
+                }
+            } catch (Throwable t) {
+                Log.e(LOG_TAG, "Failed to determine native library path " + t.getMessage());
+                nativeLibraryPath = FileManager.getNativeLibraryFolder().getPath();
+            }
+            IncrementalClassLoader.inject(
+                    classLoader,
+                    nativeLibraryPath,
+                    codeCacheDir,
+                    dexList);
+        } else {
+            Log.w(LOG_TAG, "No instant run dex files added to classpath");
+        }
+    }
+```
+调用了IncrementalClassLoader#inject()方法,IncrementalClassLoader源码如下:
+```java
+/**
+ * A class loader that loads classes from any .dex file in a particular directory on the SD card.
+ * <p>
+ * <p>Used to implement incremental deployment to Android phones.
+ */
+public class IncrementalClassLoader extends ClassLoader {
+    /** When false, compiled out of runtime library */
+    public static final boolean DEBUG_CLASS_LOADING = false;
+
+    private final DelegateClassLoader delegateClassLoader;
+
+    public IncrementalClassLoader(
+            ClassLoader original, String nativeLibraryPath, String codeCacheDir, List<String> dexes) {
+        super(original.getParent());
+
+        // TODO(bazel-team): For some mysterious reason, we need to use two class loaders so that
+        // everything works correctly. Investigate why that is the case so that the code can be
+        // simplified.
+        delegateClassLoader = createDelegateClassLoader(nativeLibraryPath, codeCacheDir, dexes,
+                original);
+    }
+
+    @Override
+    public Class<?> findClass(String className) throws ClassNotFoundException {
+        try {
+            Class<?> aClass = delegateClassLoader.findClass(className);
+            //noinspection PointlessBooleanExpression,ConstantConditions
+            if (DEBUG_CLASS_LOADING && Log.isLoggable(LOG_TAG, Log.VERBOSE)) {
+                Log.v(LOG_TAG, "Incremental class loader: findClass(" + className + ") = " + aClass);
+            }
+
+            return aClass;
+        } catch (ClassNotFoundException e) {
+            //noinspection PointlessBooleanExpression,ConstantConditions
+            if (DEBUG_CLASS_LOADING && Log.isLoggable(LOG_TAG, Log.VERBOSE)) {
+                Log.v(LOG_TAG, "Incremental class loader: findClass(" + className + ") : not found");
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * A class loader whose only purpose is to make {@code findClass()} public.
+     */
+    private static class DelegateClassLoader extends BaseDexClassLoader {
+        private DelegateClassLoader(
+                String dexPath, File optimizedDirectory, String libraryPath, ClassLoader parent) {
+            super(dexPath, optimizedDirectory, libraryPath, parent);
+        }
+
+        @Override
+        public Class<?> findClass(String name) throws ClassNotFoundException {
+            try {
+                Class<?> aClass = super.findClass(name);
+                //noinspection PointlessBooleanExpression,ConstantConditions
+                if (DEBUG_CLASS_LOADING && Log.isLoggable(LOG_TAG, Log.VERBOSE)) {
+                    Log.v(LOG_TAG, "Delegate class loader: findClass(" + name + ") = " + aClass);
+                }
+
+                return aClass;
+            } catch (ClassNotFoundException e) {
+                //noinspection PointlessBooleanExpression,ConstantConditions
+                if (DEBUG_CLASS_LOADING && Log.isLoggable(LOG_TAG, Log.VERBOSE)) {
+                    Log.v(LOG_TAG, "Delegate class loader: findClass(" + name + ") : not found");
+                }
+                throw e;
+            }
+        }
+    }
+
+    private static DelegateClassLoader createDelegateClassLoader(
+            String nativeLibraryPath, String codeCacheDir, List<String> dexes,
+            ClassLoader original) {
+        String pathBuilder = createDexPath(dexes);
+        return new DelegateClassLoader(pathBuilder, new File(codeCacheDir),
+                nativeLibraryPath, original);
+    }
+
+    @NonNull
+    private static String createDexPath(List<String> dexes) {
+        StringBuilder pathBuilder = new StringBuilder();
+        boolean first = true;
+        for (String dex : dexes) {
+            if (first) {
+                first = false;
+            } else {
+                pathBuilder.append(File.pathSeparator);
+            }
+
+            pathBuilder.append(dex);
+        }
+
+        if (Log.isLoggable(LOG_TAG, Log.VERBOSE)) {
+            Log.v(LOG_TAG, "Incremental dex path is "
+                    + BootstrapApplication.join('\n', dexes));
+        }
+        return pathBuilder.toString();
+    }
+
+    private static void setParent(ClassLoader classLoader, ClassLoader newParent) {
+        try {
+            Field parent = ClassLoader.class.getDeclaredField("parent");
+            parent.setAccessible(true);
+            parent.set(classLoader, newParent);
+        } catch (IllegalArgumentException e) {
+            throw new RuntimeException(e);
+        } catch (IllegalAccessException e) {
+            throw new RuntimeException(e);
+        } catch (NoSuchFieldException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static ClassLoader inject(
+            ClassLoader classLoader, String nativeLibraryPath, String codeCacheDir,
+            List<String> dexes) {
+        IncrementalClassLoader incrementalClassLoader =
+                new IncrementalClassLoader(classLoader, nativeLibraryPath, codeCacheDir, dexes);
+        setParent(classLoader, incrementalClassLoader);
+
+        return incrementalClassLoader;
+    }
+}
+```
+
+####1.3　createRealApplication()
+
+
+####1.4　real　application的attachBaseContext方法
 
 ##参考文档
 [1].[Instant Run: How Does it Work?!](https://medium.com/google-developers/instant-run-how-does-it-work-294a1633367f#.9q7cddaie)<br>
