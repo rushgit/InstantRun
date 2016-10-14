@@ -24,14 +24,14 @@ The app is restarted (but still not reinstalled). Required for any structural ch
 App需要重启,但不需要重新安装。适用于代码结构和方法签名变化等场景。
 
 ##Demo分析
-反编译Instant Run建构的Apk,Dex内结构如下<br>
+反编译Instant Run建构的Apk,dex文件内容如下<br>
 ![](pic/3.png)<br>
 你会看到只有com.android.build.gradle.internal.incremental和com.android.tools2个包,并没有Demo app的代码,这其实是Instant Run的框架代码,再看apk的结构,如下图<br>
-![](pic/4.png)<br>
+![](pic/4.jpg)<br>
 发现多了一个instant-run.zip文件,再看AndroidManifest.xml<br>
-![](pic/5.png)<br>
+![](pic/5.jpg)<br>
 看到App的Application被替换成了com.android.tools.fd.runtime.BootstrapApplication,那Demo的application在哪里呢? 继续看instant-run.zip<br>
-![](pic/6.png)<br>
+![](pic/6.jpg)<br>
 原来demo被打包成了多个dex文件。
 
 看到这里我们可以猜想大概的原理:
