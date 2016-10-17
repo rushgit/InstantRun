@@ -1289,25 +1289,30 @@ private void restart(int updateMode， boolean incrementalResources， boolean t
 
 ##总结
 ###编译期
-1.第一次编译时，把Instant Run框架代码打入dex中
-2.app源码代码打包成多个dex，放入instant-run.zip中
-3.修改AndroidManifest的application　name为com.android.tools.fd.runtime.BootstrapApplication
-4.为每个类添加$change静态变量，在每个方法中注入拦截逻辑
+1.第一次编译时，把Instant Run框架代码打入dex中<br>
+2.app源码代码打包成多个dex，放入instant-run.zip中<br>
+3.修改AndroidManifest的application　name为com.android.tools.fd.runtime.BootstrapApplication<br>
+4.为每个类添加$change静态变量，在每个方法中注入拦截逻辑<br>
 5.patch类类名添加$change，实现IncrementalChange接口
 
 ###启动
-1.获取资源路径
-2.替换PathClassLoader父加载器为IncrementalClassLoader来加载dex
-3.替换application为app的realApplication
-4.调用realApplication的attachBaseContext方法
-5.monkeyPatchApplication替换ActivityThread中相关的Application
-6.monkeyPatchExistingResources替换存在的AssetManager对象
-7.调用realApplication的onCreate方法
+1.获取资源路径<br>
+2.替换PathClassLoader父加载器为IncrementalClassLoader来加载dex<br>
+3.替换application为app的realApplication<br>
+4.调用realApplication的attachBaseContext方法<br>
+5.monkeyPatchApplication替换ActivityThread中相关的Application<br>
+6.monkeyPatchExistingResources替换存在的AssetManager对象<br>
+7.调用realApplication的onCreate方法<br>
 8.启动Server监听IDE消息
 
 ###运行期
-1.当Server接收到patch后，调用handleColdSwapPatch、handleHotSwapPatch、handleResourcePatch做相应的处理
+1.当Server接收到patch后，调用handleColdSwapPatch、handleHotSwapPatch、handleResourcePatch做相应的处理<br>
 2.根据updateMode，restart处理之后生效
+
+##从Instant Run中可以借鉴的思想
+###App加壳
+###插件化
+###热修复
 
 ##参考文档
 [1].[Instant Run: How Does it Work?!](https://medium.com/google-developers/instant-run-how-does-it-work-294a1633367f#.9q7cddaie)<br>
