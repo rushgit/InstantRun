@@ -661,7 +661,7 @@ public static void monkeyPatchExistingResources(@Nullable Context context,
         }
     }
 ```
-该方法是替换app中所有AssetManager为newAssetManager,具体如下:
+该方法是替换app中所有AssetManager为newAssetManager,具体如下:<br>
 **1.当资源文件(resource.ap_)有变化时,新建一个newAssetManager对象,替换当前Resource,Resource.Theme中的mAssets成员变量为newAssetManager**<br>
 **2.遍历所有已启动的Activity,把其mResources成员变量的mAssets替换为newAssetManager对象**
 
@@ -670,9 +670,494 @@ public static void monkeyPatchExistingResources(@Nullable Context context,
 
 ####2.4 调用realApplication的onCreate方法
 Application和AssetManager均已替换,调用realApplication的onCreate方法。<br>
-到这一步为止,app已经正常启动了,下一步分析Server是如何监听并处理热部署、温部署和冷部署的。
+到这一步为止,通过代码的方式,app已经正常启动了,下一步分析Server是如何监听并处理热部署、温部署和冷部署的。
 
 ###3. Server监听和处理热部署、温部署和冷部署
+这里只关注Server接收到IDE消息之后的处理,重点关注内部类SocketServerReplyThread。
+
+####3.1 SocketServerReplyThread源码如下:
+```java
+private class SocketServerReplyThread extends Thread {
+
+        private final LocalSocket mSocket;
+
+        SocketServerReplyThread(LocalSocket socket) {
+            mSocket = socket;
+        }
+
+        @Override
+        public void run() {
+            try {
+                DataInputStream input = new DataInputStream(mSocket.getInputStream());
+                DataOutputStream output = new DataOutputStream(mSocket.getOutputStream());
+                try {
+                    handle(input, output);
+                } finally {
+                    try {
+                        input.close();
+                    } catch (IOException ignore) {
+                    }
+                    try {
+                        output.close();
+                    } catch (IOException ignore) {
+                    }
+                }
+            } catch (IOException e) {
+                if (Log.isLoggable(LOG_TAG, Log.VERBOSE)) {
+                    Log.v(LOG_TAG, "Fatal error receiving messages", e);
+                }
+            }
+        }
+
+        private void handle(DataInputStream input, DataOutputStream output) throws IOException {
+            long magic = input.readLong();
+            if (magic != PROTOCOL_IDENTIFIER) {
+                Log.w(LOG_TAG, "Unrecognized header format "
+                        + Long.toHexString(magic));
+                return;
+            }
+            int version = input.readInt();
+
+            // Send current protocol version to the IDE so it can decide what to do
+            output.writeInt(PROTOCOL_VERSION);
+
+            if (version != PROTOCOL_VERSION) {
+                Log.w(LOG_TAG, "Mismatched protocol versions; app is "
+                        + "using version " + PROTOCOL_VERSION + " and tool is using version "
+                        + version);
+                return;
+            }
+
+            while (true) {
+                int message = input.readInt();
+                switch (message) {
+                    case MESSAGE_EOF: {
+                        if (Log.isLoggable(LOG_TAG, Log.VERBOSE)) {
+                            Log.v(LOG_TAG, "Received EOF from the IDE");
+                        }
+                        return;
+                    }
+
+                    case MESSAGE_PING: {
+                        // Send an "ack" back to the IDE.
+                        // The value of the boolean is true only when the app is in the
+                        // foreground.
+                        boolean active = Restarter.getForegroundActivity(mApplication) != null;
+                        output.writeBoolean(active);
+                        if (Log.isLoggable(LOG_TAG, Log.VERBOSE)) {
+                            Log.v(LOG_TAG, "Received Ping message from the IDE; " +
+                                    "returned active = " + active);
+                        }
+                        continue;
+                    }
+
+                    case MESSAGE_PATH_EXISTS: {
+                        String path = input.readUTF();
+                        long size = FileManager.getFileSize(path);
+                        output.writeLong(size);
+                        if (Log.isLoggable(LOG_TAG, Log.VERBOSE)) {
+                            Log.v(LOG_TAG, "Received path-exists(" + path + ") from the " +
+                                    "IDE; returned size=" + size);
+                        }
+                        continue;
+                    }
+
+                    case MESSAGE_PATH_CHECKSUM: {
+                        long begin = System.currentTimeMillis();
+                        String path = input.readUTF();
+                        byte[] checksum = FileManager.getCheckSum(path);
+                        if (checksum != null) {
+                            output.writeInt(checksum.length);
+                            output.write(checksum);
+                            if (Log.isLoggable(LOG_TAG, Log.VERBOSE)) {
+                                long end = System.currentTimeMillis();
+                                String hash = new BigInteger(1, checksum).toString(16);
+                                Log.v(LOG_TAG, "Received checksum(" + path + ") from the " +
+                                        "IDE: took " + (end - begin) + "ms to compute " + hash);
+                            }
+                        } else {
+                            output.writeInt(0);
+                            if (Log.isLoggable(LOG_TAG, Log.VERBOSE)) {
+                                Log.v(LOG_TAG, "Received checksum(" + path + ") from the " +
+                                        "IDE: returning <null>");
+                            }
+                        }
+                        continue;
+                    }
+
+                    case MESSAGE_RESTART_ACTIVITY: {
+                        if (!authenticate(input)) {
+                            return;
+                        }
+
+                        Activity activity = Restarter.getForegroundActivity(mApplication);
+                        if (activity != null) {
+                            if (Log.isLoggable(LOG_TAG, Log.VERBOSE)) {
+                                Log.v(LOG_TAG, "Restarting activity per user request");
+                            }
+                            Restarter.restartActivityOnUiThread(activity);
+                        }
+                        continue;
+                    }
+
+                    case MESSAGE_PATCHES: {
+                        if (!authenticate(input)) {
+                            return;
+                        }
+
+                        List<ApplicationPatch> changes = ApplicationPatch.read(input);
+                        if (changes == null) {
+                            continue;
+                        }
+
+                        boolean hasResources = hasResources(changes);
+                        int updateMode = input.readInt();
+                        updateMode = handlePatches(changes, hasResources, updateMode);
+
+                        boolean showToast = input.readBoolean();
+
+                        // Send an "ack" back to the IDE; this is used for timing purposes only
+                        output.writeBoolean(true);
+
+                        restart(updateMode, hasResources, showToast);
+                        continue;
+                    }
+
+                    case MESSAGE_SHOW_TOAST: {
+                        String text = input.readUTF();
+                        Activity foreground = Restarter.getForegroundActivity(mApplication);
+                        if (foreground != null) {
+                            Restarter.showToast(foreground, text);
+                        } else if (Log.isLoggable(LOG_TAG, Log.VERBOSE)) {
+                            Log.v(LOG_TAG, "Couldn't show toast (no activity) : " + text);
+                        }
+                        continue;
+                    }
+
+                    default: {
+                        if (Log.isLoggable(LOG_TAG, Log.ERROR)) {
+                            Log.e(LOG_TAG, "Unexpected message type: " + message);
+                        }
+                        // If we hit unexpected message types we can't really continue
+                        // the conversation: we can misinterpret data for the unexpected
+                        // command as separate messages with different meanings than intended
+                        return;
+                    }
+                }
+            }
+        }
+
+        .......
+    }
+```
+可以看到,SocketServerReplyThread读取到不同的消息类型做不同的处理:<br>
+1. 读到MESSAGE_EOF,表示读到消息末尾,退出读取操作<br>
+2. 读到MESSAGE_PING,告知IDE,app是否在前台<br>
+3. 读到MESSAGE_PATH_EXISTS,记录传递的文件大小<br>
+4. 读到MESSAGE_PATH_CHECKSUM,记录传递的文件的MD5值和MD5长度<br>
+5. 读到MESSAGE_RESTART_ACTIVITY,如果有当前app Activity在前台,重启当前Activity<br>
+6. **读到MESSAGE_PATCHES,读取patch列表,调用handlePatches处理patch,下面具体分析**<br>
+7. 读到MESSAGE_SHOW_TOAST,在当前activity中弹toast
+
+####3.2 Server#handlePatches()
+```java
+private int handlePatches(@NonNull List<ApplicationPatch> changes, boolean hasResources,
+            int updateMode) {
+        if (hasResources) {
+            FileManager.startUpdate();
+        }
+
+        for (ApplicationPatch change : changes) {
+            String path = change.getPath();
+            if (path.endsWith(CLASSES_DEX_SUFFIX)) {
+                handleColdSwapPatch(change);
+
+                // Gradle sometimes sends a restart dex even when there is a hotswap patch,
+                // so don't take the presence of a restart dex as a conclusion that we must
+                // do a coldswap. Check.
+                boolean canHotSwap = false;
+                for (ApplicationPatch c : changes) {
+                    if (c.getPath().equals(RELOAD_DEX_FILE_NAME)) {
+                        canHotSwap = true;
+                        break;
+                    }
+                }
+
+                if (!canHotSwap) {
+                    updateMode = UPDATE_MODE_COLD_SWAP;
+                }
+
+            } else if (path.equals(RELOAD_DEX_FILE_NAME)) {
+                updateMode = handleHotSwapPatch(updateMode, change);
+            } else if (isResourcePath(path)) {
+                updateMode = handleResourcePatch(updateMode, change, path);
+            }
+        }
+
+        if (hasResources) {
+            FileManager.finishUpdate(true);
+        }
+
+        return updateMode;
+    }
+```
+循环遍历每个patch:<br>
+1. 如果patch文件名以CLASSES_DEX_SUFFIX(.dex)结尾,调用handleColdSwapPatch处理冷部署<br>
+2. 如果patch文件名以RELOAD_DEX_FILE_NAME(classes.dex.3)结尾,调用handleHotSwapPatch处理热部署<br>
+3. 如果为资源,则通过handleResourcePatch处理<br>
+最终部署方式取决于所有patch中条件要求最高的。
+
+#####3.2.1 handleColdSwapPatch冷部署
+```java
+private static void handleColdSwapPatch(@NonNull ApplicationPatch patch) {
+        if (patch.path.startsWith(Paths.DEX_SLICE_PREFIX)) {
+            File file = FileManager.writeDexShard(patch.getBytes(), patch.path);
+            if (Log.isLoggable(LOG_TAG, Log.VERBOSE)) {
+                Log.v(LOG_TAG, "Received dex shard " + file);
+            }
+        }
+    }
+```
+实现很简单,把dex写入文件即可,等待app重启即可生效。
+
+#####3.2.2 handleHotSwapPatch热部署
+```java
+private int handleHotSwapPatch(int updateMode, @NonNull ApplicationPatch patch) {
+        if (Log.isLoggable(LOG_TAG, Log.VERBOSE)) {
+            Log.v(LOG_TAG, "Received incremental code patch");
+        }
+        try {
+            String dexFile = FileManager.writeTempDexFile(patch.getBytes());
+            if (dexFile == null) {
+                Log.e(LOG_TAG, "No file to write the code to");
+                return updateMode;
+            } else if (Log.isLoggable(LOG_TAG, Log.VERBOSE)) {
+                Log.v(LOG_TAG, "Reading live code from " + dexFile);
+            }
+            String nativeLibraryPath = FileManager.getNativeLibraryFolder().getPath();
+            DexClassLoader dexClassLoader = new DexClassLoader(dexFile,
+                    mApplication.getCacheDir().getPath(), nativeLibraryPath,
+                    getClass().getClassLoader());
+
+            // we should transform this process with an interface/impl
+            Class<?> aClass = Class.forName(
+                    "com.android.tools.fd.runtime.AppPatchesLoaderImpl", true, dexClassLoader);
+            try {
+                if (Log.isLoggable(LOG_TAG, Log.VERBOSE)) {
+                    Log.v(LOG_TAG, "Got the patcher class " + aClass);
+                }
+
+                PatchesLoader loader = (PatchesLoader) aClass.newInstance();
+                if (Log.isLoggable(LOG_TAG, Log.VERBOSE)) {
+                    Log.v(LOG_TAG, "Got the patcher instance " + loader);
+                }
+                String[] getPatchedClasses = (String[]) aClass
+                        .getDeclaredMethod("getPatchedClasses").invoke(loader);
+                if (Log.isLoggable(LOG_TAG, Log.VERBOSE)) {
+                    Log.v(LOG_TAG, "Got the list of classes ");
+                    for (String getPatchedClass : getPatchedClasses) {
+                        Log.v(LOG_TAG, "class " + getPatchedClass);
+                    }
+                }
+                if (!loader.load()) {
+                    updateMode = UPDATE_MODE_COLD_SWAP;
+                }
+            } catch (Exception e) {
+                Log.e(LOG_TAG, "Couldn't apply code changes", e);
+                e.printStackTrace();
+                updateMode = UPDATE_MODE_COLD_SWAP;
+            }
+        } catch (Throwable e) {
+            Log.e(LOG_TAG, "Couldn't apply code changes", e);
+            updateMode = UPDATE_MODE_COLD_SWAP;
+        }
+        return updateMode;
+    }
+```
+1. 将patch写入临时dex文件<br>
+2. 通过DexClassLoader动态加载patch dex<br>
+3. 反射patch中的com.android.tools.fd.runtime.AppPatchesLoaderImpl类,调用getPatchedClasses()找到所有patch类<br>
+4. 调用反射的AppPatchesLoaderImpl对象的load方法实现热部署<br>
+5. 如果热部署失败,尝试冷部署<br>
+我们一步步分析,先看下AppPatchesLoaderImpl类。
+```java
+public class AppPatchesLoaderImpl extends AbstractPatchesLoaderImpl {
+    public static final long BUILD_ID = 16638070999730L;
+
+    public AppPatchesLoaderImpl() {
+    }
+
+    public String[] getPatchedClasses() {
+        return new String[]{"com.rush.androidtest.test.TestActivity"};
+    }
+}
+```
+其由IDE生成patch时自动生成,继承自AbstractPatchesLoaderImpl, getPatchedClasses()里返回所有需要patch的class<br>
+再看基类AbstractPatchesLoaderImpl:
+```java
+public abstract class AbstractPatchesLoaderImpl implements PatchesLoader {
+
+    public abstract String[] getPatchedClasses();
+
+    @Override
+    public boolean load() {
+        try {
+            for (String className : getPatchedClasses()) {
+                ClassLoader cl = getClass().getClassLoader();
+                Class<?> aClass = cl.loadClass(className + "$override");
+                Object o = aClass.newInstance();
+                Class<?> originalClass = cl.loadClass(className);
+                Field changeField = originalClass.getDeclaredField("$change");
+                // force the field accessibility as the class might not be "visible"
+                // from this package.
+                changeField.setAccessible(true);
+
+                // If there was a previous change set, mark it as obsolete:
+                Object previous = changeField.get(null);
+                if (previous != null) {
+                    Field isObsolete = previous.getClass().getDeclaredField("$obsolete");
+                    if (isObsolete != null) {
+                        isObsolete.set(null, true);
+                    }
+                }
+                changeField.set(null, o);
+
+                if (logging != null && logging.isLoggable(Level.FINE)) {
+                    logging.log(Level.FINE, String.format("patched %s", className));
+                }
+            }
+        } catch (Exception e) {
+            if (logging != null) {
+                logging.log(Level.SEVERE, String.format("Exception while patching %s", "foo.bar"), e);
+            }
+            return false;
+        }
+        return true;
+    }
+}
+```
+关注load()方法:<br>
+针对getPatchedClasses()中的每个类,根据originalClassName,从本classloader,即patch中创建{originalClassName}$change类对象,并将其它赋值给originalClass的$change静态变量。<br>
+<br>
+
+分析到这里,我们大概理解了Instant Run的热部署原理:
+#####1
+在app第一次编译时,每一个类都被注入了一个实现了IncrementalChange的静态变量$change,并在每一个方法开始处注入了一段逻辑:
+```java
+    IncrementalChange localObject = $change;
+    if (localObject != null) {
+      localObject.access$dispatch("onCreate.(Landroid/os/Bundle;)V", new Object[] { this, paramBundle });
+      return;
+    }
+```
+所以当$change不为null时,派发到IncrementalChange中的access$dispatch方法执行。查看下demo中TestActivty反编译后的代码:
+```java
+public class TestActivity extends Activity implements OnClickListener {
+    public static final long serialVersionUID = 0L;
+
+    public TestActivity() {
+        IncrementalChange var1 = $change;
+        if(var1 != null) {
+            Object[] var10001 = (Object[])var1.access$dispatch("init$args.([Lcom/rush/androidtest/test/TestActivity;[Ljava/lang/Object;)Ljava/lang/Object;", new Object[]{null, new Object[0]});
+            Object[] var2 = (Object[])var10001[0];
+            this(var10001, (InstantReloadException)null);
+            var2[0] = this;
+            var1.access$dispatch("init$body.(Lcom/rush/androidtest/test/TestActivity;[Ljava/lang/Object;)V", var2);
+        } else {
+            super();
+        }
+    }
+
+    public void onCreate(Bundle savedInstanceState) {
+        IncrementalChange var2 = $change;
+        if(var2 != null) {
+            var2.access$dispatch("onCreate.(Landroid/os/Bundle;)V", new Object[]{this, savedInstanceState});
+        } else {
+            super.onCreate(savedInstanceState);
+            this.setContentView(2130968577);
+            boolean a = true;
+            this.findViewById(2131165186).setOnClickListener(this);
+        }
+    }
+
+    public void onClick(View v) {
+        IncrementalChange var2 = $change;
+        if(var2 != null) {
+            var2.access$dispatch("onClick.(Landroid/view/View;)V", new Object[]{this, v});
+        } else {
+            Toast.makeText(this, "hello, world!!", 0).show();
+        }
+    }
+
+    TestActivity(Object[] var1, InstantReloadException var2) {
+        String var3 = (String)var1[1];
+        switch(var3.hashCode()) {
+        case -1230767868:
+            super();
+            return;
+        case 1797033358:
+            this();
+            return;
+        default:
+            throw new InstantReloadException(String.format("String switch could not find \'%s\' with hashcode %s in %s", new Object[]{var3, Integer.valueOf(var3.hashCode()), "com/rush/androidtest/test/TestActivity"}));
+        }
+    }
+}
+```
+可以看到,每个方法都在开始处注入了这段逻辑。
+#####2
+再看下Instant Run后生成的patch类,查看反编译后的代码:<br>
+build/intermediates/transforms/instantRun/debug/folders/4000/5/enhanced/目录下
+```java
+public class TestActivity$override implements IncrementalChange {
+    public TestActivity$override() {
+    }
+
+    public static Object init$args(TestActivity[] var0, Object[] var1) {
+        Object[] var2 = new Object[]{new Object[]{var0, new Object[0]}, "android/app/Activity.()V"};
+        return var2;
+    }
+
+    public static void init$body(TestActivity $this, Object[] var1) {
+    }
+
+    public static void onCreate(TestActivity $this, Bundle savedInstanceState) {
+        Object[] var2 = new Object[]{savedInstanceState};
+        TestActivity.access$super($this, "onCreate.(Landroid/os/Bundle;)V", var2);
+        $this.setContentView(2130968577);
+        boolean a = true;
+        $this.findViewById(2131165186).setOnClickListener($this);
+    }
+
+    public static void onClick(TestActivity $this, View v) {
+        Toast.makeText($this, "hello, world!!", 0).show();
+    }
+
+    public Object access$dispatch(String var1, Object... var2) {
+        switch(var1.hashCode()) {
+        case -1912803358:
+            onClick((TestActivity)var2[0], (View)var2[1]);
+            return null;
+        case -641568046:
+            onCreate((TestActivity)var2[0], (Bundle)var2[1]);
+            return null;
+        case 480651276:
+            init$body((TestActivity)var2[0], (Object[])var2[1]);
+            return null;
+        case 923115526:
+            return init$args((TestActivity[])var2[0], (Object[])var2[1]);
+        default:
+            throw new InstantReloadException(String.format("String switch could not find \'%s\' with hashcode %s in %s", new Object[]{var1, Integer.valueOf(var1.hashCode()), "com/rush/androidtest/test/TestActivity"}));
+        }
+    }
+}
+```
+可以看到patch类类名加上了$change,并实现了IncrementalChange的access$dispatch方法。
+#####3
+IDE打包时生成AppPatchesLoaderImpl类,其getPatchedClasses方法返回所有修改过的类的列表。
+#####4
+执行AppPatchesLoaderImpl父类AbstractPatchesLoaderImpl的load方法,针对getPatchedClasses返回的每个类,加载对应的$change类,赋值到其$change静态变量中,达到运行时改变逻辑的目的。AppPatchesLoaderImpl和AbstractPatchesLoaderImpl的源码前面已经分析过。
+
 
 ##参考文档
 [1].[Instant Run: How Does it Work?!](https://medium.com/google-developers/instant-run-how-does-it-work-294a1633367f#.9q7cddaie)<br>
