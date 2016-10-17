@@ -276,6 +276,10 @@ public class IncrementalClassLoader extends ClassLoader {
     }
 }
 ```
+这里需要先介绍一下ClassLoader的双亲委派模型(Parent Delegation Model),其工作过程是这样的:<br>
+如果一个类加载器收到了类加载的请求,它首先不会自己去尝试加载这个类,优先委派给父加载器去加载,每一层都向上委派,直到顶层的类加载器(在Android里是BootClassLoader),只有当父类无法完成加载时,子类才会尝试去加载。<br>
+App的类加载器是PathClassLoader,其父加载器为BootClassLoader,Instant　Run通过反射改变PathClassLoader的父加载器,达到inject的方式,inject前后结构如下图所示:<br>
+![](pic/7.png)<br>
 
 ####1.3　createRealApplication()
 
